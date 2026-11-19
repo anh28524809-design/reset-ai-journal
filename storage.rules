@@ -1,0 +1,42 @@
+rules_version = '2';
+
+// RESET-AI – Cloud Storage Security Rules (dùng cross-service rules để đọc vai trò trong Firestore)
+service firebase.storage {
+  match /b/{bucket}/o {
+    function roles() { return /databases/(default)/documents/roles/$(request.auth.token.email.lower()); }
+    function isMember() {
+      return request.auth != null && request.auth.token.email != null
+        && request.auth.token.email_verified == true
+        && firestore.exists(roles());
+    }
+    function isTeacher() { return isMember() && firestore.get(roles()).data.role == 'teacher'; }
+    function sizeOk() { return request.resource.size < 200 * 1024 * 1024; }
+
+    // Minh chứng: công khai chỉ khi giáo viên đã duyệt (có bản ghi public_evidence)
+    match /evidence/{entryId}/{evId}/{file} {
+      allow read: if isMember()
+        || firestore.exists(/databases/(default)/documents/public_evidence/$(evId));
+      allow create: if isMember() && sizeOk();
+      allow update: if false;
+      allow delete: if isTeacher()
+        || (isMember() && !firestore.exists(/databases/(default)/documents/public_evidence/$(evId)));
+    }
+
+    // Tệp hồ sơ khoa học: công khai khi mục hồ sơ được giáo viên công bố
+    match /dossier/{id}/{file} {
+      allow read: if isMember()
+        || firestore.get(/databases/(default)/documents/dossier/$(id)).data.published == true;
+      allow create: if isMember() && sizeOk();
+      allow update: if false;
+      allow delete: if isMember();
+    }
+
+    // Dữ liệu gốc có thông tin định danh: chỉ thành viên nhóm
+    match /private/{all=**} {
+      allow read: if isMember();
+      allow create: if isMember() && sizeOk();
+      allow update: if false;
+      allow delete: if isMember();
+    }
+  }
+}

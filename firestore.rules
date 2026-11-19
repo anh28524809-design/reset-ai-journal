@@ -1,0 +1,177 @@
+rules_version = '2';
+
+// RESET-AI – Firestore Security Rules
+// Vai trò lưu tại /roles/{email viết thường}: { role: 'teacher' | 'student', name }
+// Giám khảo / khách: không cần đăng nhập, chỉ đọc được dữ liệu công khai đã được giáo viên duyệt.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null && request.auth.token.email != null
+        && request.auth.token.email_verified == true;
+    }
+    function myEmail() { return request.auth.token.email.lower(); }
+    function rolePath() { return /databases/$(database)/documents/roles/$(myEmail()); }
+    function isMember() {
+      return signedIn() && exists(rolePath())
+        && get(rolePath()).data.role in ['teacher', 'student'];
+    }
+    function isTeacher() { return isMember() && get(rolePath()).data.role == 'teacher'; }
+    function myName() { return get(rolePath()).data.name; }
+
+    function nd() { return request.resource.data; }
+    function od() { return resource.data; }
+    function unchanged(keys) { return !nd().diff(od()).affectedKeys().hasAny(keys); }
+
+    // ---------------- Vai trò ----------------
+    match /roles/{em} {
+      allow read: if isTeacher() || (signedIn() && em == myEmail());
+      allow create, update: if isTeacher() && nd().role in ['teacher', 'student'] && nd().name is string;
+      allow delete: if isTeacher() && em != myEmail();
+    }
+
+    // ---------------- Cấu hình công khai ----------------
+    match /settings/{id} {
+      allow read: if true;
+      allow write: if isTeacher();
+    }
+    match /stages/{id} {
+      allow read: if true;
+      allow write: if isTeacher();
+    }
+    match /public_meta/{id} {
+      allow read: if true;
+      allow write: if isTeacher();
+    }
+
+    // ---------------- Bộ đếm mã nhật ký ----------------
+    match /counters/{id} {
+      allow read: if isMember();
+      allow create: if isMember() && nd().next == 2;
+      allow update: if isMember() && nd().next == od().next + 1;
+      allow delete: if false;
+    }
+
+    // ---------------- Nhật ký nội bộ ----------------
+    match /entries/{entryId} {
+      function verifyFields() { return ['verifiedAt', 'verifiedByUid', 'verifiedByName']; }
+      function versionSaved() {
+        return existsAfter(/databases/$(database)/documents/entries/$(entryId)/versions/$(string(od().version)));
+      }
+      function versionOk() {
+        return nd().version == od().version
+          || (nd().version == od().version + 1 && versionSaved());
+      }
+      function owner() {
+        return od().createdBy == request.auth.uid || myName() in od().performers;
+      }
+      function teacherOk() {
+        return isTeacher() && versionOk() && (
+          // Xác nhận: thời điểm phải do máy chủ ghi
+          (nd().status == 'verified' && od().status != 'verified'
+            && nd().verifiedAt == request.time && nd().verifiedByUid == request.auth.uid
+            && nd().version == od().version)
+          // Trả lại / chỉnh sửa khi chưa xác nhận
+          || (od().status != 'verified' && nd().status in ['draft', 'submitted', 'returned']
+            && unchanged(verifyFields()) && nd().version == od().version)
+          // Chỉnh sửa sau xác nhận → phải tạo phiên bản mới
+          || (od().status == 'verified' && nd().status == 'submitted'
+            && nd().version == od().version + 1 && unchanged(verifyFields()))
+        );
+      }
+      function studentOk() {
+        return isMember() && owner() && versionOk()
+          && unchanged(['teacherComment', 'verifiedAt', 'verifiedByUid', 'verifiedByName'])
+          && (
+            (od().status in ['draft', 'returned'] && nd().status in ['draft', 'submitted'] && nd().version == od().version)
+            || (od().status == 'submitted' && nd().status == 'draft' && nd().version == od().version)
+            || (od().status == 'verified' && nd().status == 'submitted' && nd().version == od().version + 1)
+          );
+      }
+
+      allow read: if isMember();
+      allow create: if isMember()
+        && nd().createdAt == request.time
+        && nd().updatedAt == request.time
+        && nd().createdBy == request.auth.uid
+        && nd().status == 'draft'
+        && nd().version == 1
+        && nd().verifiedAt == null
+        && nd().teacherComment == ''
+        && nd().code is string;
+      allow update: if isMember()
+        && nd().updatedAt == request.time
+        && nd().updatedBy == request.auth.uid
+        && unchanged(['code', 'createdAt', 'createdBy', 'createdByName', 'importKey'])
+        && (teacherOk() || studentOk());
+      allow delete: if isTeacher()
+        || (isMember() && od().createdBy == request.auth.uid && od().status == 'draft' && od().version == 1);
+
+      // Phiên bản lưu trữ: chỉ thêm, không sửa, không xóa
+      match /versions/{v} {
+        allow read: if isMember();
+        allow create: if isMember()
+          && getAfter(/databases/$(database)/documents/entries/$(entryId)).data.version == int(v) + 1;
+        allow update, delete: if false;
+      }
+
+      // Lịch sử thay đổi: chỉ thêm, thời điểm do máy chủ ghi
+      match /history/{h} {
+        allow read: if isMember();
+        allow create: if isMember()
+          && nd().at == request.time
+          && nd().byUid == request.auth.uid
+          && existsAfter(/databases/$(database)/documents/entries/$(entryId));
+        allow update, delete: if false;
+      }
+    }
+
+    // ---------------- Minh chứng nội bộ ----------------
+    match /evidence/{evId} {
+      allow read: if isMember();
+      allow create: if isMember()
+        && nd().uploadedBy == request.auth.uid
+        && nd().uploadedAt == request.time
+        && nd().approved == false
+        && nd().featured == false
+        && exists(/databases/$(database)/documents/entries/$(nd().entryId));
+      allow update: if unchanged(['uploadedAt', 'uploadedBy', 'storagePath', 'entryId', 'fileName']) && (
+        isTeacher()
+        || (isMember() && od().uploadedBy == request.auth.uid && od().approved == false
+          && unchanged(['approved', 'featured', 'approvedAt']))
+      );
+      allow delete: if isTeacher()
+        || (isMember() && od().uploadedBy == request.auth.uid && od().approved == false);
+    }
+
+    // ---------------- Bản công khai (giám khảo xem) ----------------
+    match /public_entries/{id} {
+      allow read: if true;
+      allow create, update: if isTeacher() && nd().verifiedAt == request.time && nd().status == 'verified';
+      allow delete: if isTeacher();
+    }
+    match /public_evidence/{id} {
+      allow read: if true;
+      allow create, update: if isTeacher()
+        && get(/databases/$(database)/documents/evidence/$(id)).data.sensitive == false
+        && nd().sensitive == false;
+      allow delete: if isTeacher();
+    }
+
+    // ---------------- Kết quả & hồ sơ: học sinh soạn, giáo viên công bố ----------------
+    match /results/{id} {
+      allow read: if resource.data.published == true || isMember();
+      allow create: if isMember() && nd().updatedAt == request.time && (isTeacher() || nd().published == false);
+      allow update: if isMember() && nd().updatedAt == request.time
+        && (isTeacher() || (od().published == false && nd().published == false));
+      allow delete: if isTeacher() || (isMember() && od().published == false);
+    }
+    match /dossier/{id} {
+      allow read: if resource.data.published == true || isMember();
+      allow create: if isMember() && nd().updatedAt == request.time && (isTeacher() || nd().published == false);
+      allow update: if isMember() && nd().updatedAt == request.time
+        && (isTeacher() || (od().published == false && nd().published == false));
+      allow delete: if isTeacher();
+    }
+  }
+}
